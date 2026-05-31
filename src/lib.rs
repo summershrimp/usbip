@@ -10,10 +10,10 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{ErrorKind, Result};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
+use tokio::time::{Duration, Instant, sleep_until};
 use usbip_protocol::UsbIpCommand;
 
 #[cfg(feature = "serde")]
@@ -37,7 +37,7 @@ pub use interface::*;
 pub use setup::*;
 pub use util::*;
 
-use crate::usbip_protocol::{USBIP_RET_SUBMIT, USBIP_RET_UNLINK, UsbIpResponse};
+use crate::usbip_protocol::{USBIP_RET_SUBMIT, USBIP_RET_UNLINK, UsbIpHeaderBasic, UsbIpResponse};
 
 /// Main struct of a USB/IP server
 #[derive(Default, Debug)]
@@ -382,13 +382,87 @@ impl UsbIpServer {
     }
 }
 
-pub async fn handler<T: AsyncReadExt + AsyncWriteExt + Unpin>(
+async fn handle_submit(
+    device: &UsbDevice,
+    header: &UsbIpHeaderBasic,
+    real_ep: u32,
+    out: bool,
+    transfer_buffer_length: u32,
+    setup: [u8; 8],
+    data: &[u8],
+) -> UsbIpResponse {
+    match device.find_ep(real_ep as u8) {
+        None => {
+            warn!("Endpoint {real_ep:02x?} not found");
+            UsbIpResponse::usbip_ret_submit_fail(header)
+        }
+        Some((ep, intf)) => {
+            trace!("->Endpoint {ep:02x?}");
+            trace!("->Setup {setup:02x?}");
+            trace!("->Request {data:02x?}");
+            let resp = device
+                .handle_urb(
+                    ep,
+                    intf,
+                    transfer_buffer_length,
+                    SetupPacket::parse(&setup),
+                    data,
+                )
+                .await;
+
+            match resp {
+                Ok(resp) => {
+                    if out {
+                        trace!("<-Wrote {}", data.len());
+                    } else {
+                        trace!("<-Resp {resp:02x?}");
+                    }
+                    let actual_length = if out {
+                        debug_assert!(
+                            resp.is_empty(),
+                            "OUT transfer should return empty response buffer"
+                        );
+                        data.len() as u32
+                    } else {
+                        resp.len() as u32
+                    };
+                    UsbIpResponse::usbip_ret_submit_success(
+                        header,
+                        0,
+                        0,
+                        actual_length,
+                        resp,
+                        vec![],
+                    )
+                }
+                Err(err) => {
+                    warn!("Error handling URB: {err}");
+                    UsbIpResponse::usbip_ret_submit_fail(header)
+                }
+            }
+        }
+    }
+}
+
+pub async fn handler<T: AsyncRead + AsyncWrite + Unpin>(
     mut socket: &mut T,
     server: Arc<UsbIpServer>,
 ) -> Result<()> {
+    let (mut reader, mut writer) = tokio::io::split(&mut socket);
+    let (delayed_tx, mut delayed_rx) = mpsc::channel::<UsbIpResponse>(64);
     let mut current_import_device_id: Option<String> = None;
+    let mut interrupt_deadlines = HashMap::<u8, Instant>::new();
     loop {
-        let command = UsbIpCommand::read_from_socket(&mut socket).await;
+        let command = tokio::select! {
+            command = UsbIpCommand::read_from_socket(&mut reader) => command,
+            delayed_response = delayed_rx.recv() => {
+                if let Some(res) = delayed_response {
+                    res.write_to_socket(&mut writer).await?;
+                    trace!("Sent delayed USB/IP response");
+                }
+                continue;
+            }
+        };
         if let Err(err) = command {
             if let Some(dev_id) = current_import_device_id {
                 let mut used_devices = server.used_devices.write().await;
@@ -419,7 +493,7 @@ pub async fn handler<T: AsyncReadExt + AsyncWriteExt + Unpin>(
 
                 // OP_REP_DEVLIST
                 UsbIpResponse::op_rep_devlist(&devices)
-                    .write_to_socket(socket)
+                    .write_to_socket(&mut writer)
                     .await?;
                 trace!("Sent OP_REP_DEVLIST");
             }
@@ -450,7 +524,7 @@ pub async fn handler<T: AsyncReadExt + AsyncWriteExt + Unpin>(
                 } else {
                     UsbIpResponse::op_rep_import_fail()
                 };
-                res.write_to_socket(socket).await?;
+                res.write_to_socket(&mut writer).await?;
                 trace!("Sent OP_REP_IMPORT");
             }
             UsbIpCommand::UsbIpCmdSubmit {
@@ -468,59 +542,71 @@ pub async fn handler<T: AsyncReadExt + AsyncWriteExt + Unpin>(
 
                 header.command = USBIP_RET_SUBMIT.into();
 
-                let res = match device.find_ep(real_ep as u8) {
-                    None => {
-                        warn!("Endpoint {real_ep:02x?} not found");
-                        UsbIpResponse::usbip_ret_submit_fail(&header)
-                    }
-                    Some((ep, intf)) => {
+                let interrupt_delay = device.find_ep(real_ep as u8).and_then(|(ep, _)| {
+                    if !out
+                        && ep.direction() == Direction::In
+                        && ep.attributes & 0b11 == EndpointAttributes::Interrupt as u8
+                        && ep.interval != 0
+                    {
                         trace!("->Endpoint {ep:02x?}");
                         trace!("->Setup {setup:02x?}");
                         trace!("->Request {data:02x?}");
-                        let resp = device
-                            .handle_urb(
-                                ep,
-                                intf,
-                                transfer_buffer_length,
-                                SetupPacket::parse(&setup),
-                                &data,
-                            )
-                            .await;
-
-                        match resp {
-                            Ok(resp) => {
-                                if out {
-                                    trace!("<-Wrote {}", data.len());
-                                } else {
-                                    trace!("<-Resp {resp:02x?}");
-                                }
-                                let actual_length = if out {
-                                    debug_assert!(
-                                        resp.is_empty(),
-                                        "OUT transfer should return empty response buffer"
-                                    );
-                                    data.len() as u32
-                                } else {
-                                    resp.len() as u32
-                                };
-                                UsbIpResponse::usbip_ret_submit_success(
-                                    &header,
-                                    0,
-                                    0,
-                                    actual_length,
-                                    resp,
-                                    vec![],
-                                )
-                            }
-                            Err(err) => {
-                                warn!("Error handling URB: {err}");
-                                UsbIpResponse::usbip_ret_submit_fail(&header)
-                            }
-                        }
+                        Some((ep.address, ep.interval))
+                    } else {
+                        None
                     }
-                };
-                res.write_to_socket(socket).await?;
-                trace!("Sent USBIP_RET_SUBMIT");
+                });
+                if let Some((ep_address, ep_interval)) = interrupt_delay {
+                    let interval = Duration::from_millis(ep_interval as u64);
+                    let now = Instant::now();
+                    let deadline = interrupt_deadlines
+                        .entry(ep_address)
+                        .or_insert(now + interval);
+                    let wait_until = if *deadline > now {
+                        let wait_until = *deadline;
+                        *deadline += interval;
+                        Some(wait_until)
+                    } else {
+                        while *deadline <= now {
+                            *deadline += interval;
+                        }
+                        None
+                    };
+
+                    let delayed_tx = delayed_tx.clone();
+                    let device = device.clone();
+                    let header = header.clone();
+                    tokio::spawn(async move {
+                        if let Some(wait_until) = wait_until {
+                            sleep_until(wait_until).await;
+                        }
+                        let res = handle_submit(
+                            &device,
+                            &header,
+                            real_ep,
+                            out,
+                            transfer_buffer_length,
+                            setup,
+                            &data,
+                        )
+                        .await;
+                        let _ = delayed_tx.send(res).await;
+                    });
+                    trace!("Scheduled delayed USBIP_RET_SUBMIT");
+                } else {
+                    let res = handle_submit(
+                        device,
+                        &header,
+                        real_ep,
+                        out,
+                        transfer_buffer_length,
+                        setup,
+                        &data,
+                    )
+                    .await;
+                    res.write_to_socket(&mut writer).await?;
+                    trace!("Sent USBIP_RET_SUBMIT");
+                }
             }
             UsbIpCommand::UsbIpCmdUnlink {
                 mut header,
@@ -531,7 +617,7 @@ pub async fn handler<T: AsyncReadExt + AsyncWriteExt + Unpin>(
                 header.command = USBIP_RET_UNLINK.into();
 
                 let res = UsbIpResponse::usbip_ret_unlink_success(&header);
-                res.write_to_socket(socket).await?;
+                res.write_to_socket(&mut writer).await?;
                 trace!("Sent USBIP_RET_UNLINK");
             }
         }
@@ -565,6 +651,7 @@ pub async fn server(addr: SocketAddr, server: Arc<UsbIpServer>) {
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::{net::TcpStream, task::JoinSet};
 
     use super::*;
